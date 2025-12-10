@@ -23,7 +23,8 @@ def save_ply(
     opacities: torch.Tensor,
     colors: torch.Tensor,
     voxel_size: float = None,
-    vmin: torch.Tensor = None
+    vmin: torch.Tensor = None,
+    octree_depth: int = None
 ) -> None:
     """
     Save 3D Gaussians to a PLY file.
@@ -37,6 +38,7 @@ def save_ply(
         colors: [N, C] Colors (spherical harmonics coefficients)
         voxel_size: Optional voxel size for voxelized Gaussians
         vmin: Optional [3] minimum voxel bounds for voxelized Gaussians
+        octree_depth: Optional voxel octree depth (J) metadata
     """
     N = means.shape[0]
     color_dim = colors.shape[1]
@@ -63,6 +65,8 @@ def save_ply(
         if vmin is not None:
             vmin_np = vmin.detach().cpu().float().numpy()
             f.write(f"comment vmin {vmin_np[0]} {vmin_np[1]} {vmin_np[2]}\n".encode())
+        if octree_depth is not None:
+            f.write(f"comment octree_depth {octree_depth}\n".encode())
 
         f.write(f"element vertex {N}\n".encode())
 
@@ -202,6 +206,265 @@ def print_metrics(metrics: Dict[str, float], title: str = "Quality Metrics") -> 
     print(f"  Max distance:  {metrics['quaternion_max_dist']:.6e}")
 
 
+def load_cameras_from_colmap(
+    colmap_sparse_path: str,
+    device: str = 'cuda',
+    max_views: int = None,
+    normalize: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    """
+    Load camera parameters from COLMAP sparse reconstruction.
+
+    Uses pycolmap to read cameras.bin and images.bin from the COLMAP sparse directory.
+
+    Args:
+        colmap_sparse_path: Path to COLMAP sparse directory (containing cameras.bin and images.bin)
+        device: Device to use
+        max_views: Maximum number of views to load (None = load all)
+        normalize: Whether to normalize the world space (should match training setting)
+
+    Returns:
+        camtoworlds: [n_views, 4, 4] Camera-to-world matrices
+        Ks: [n_views, 3, 3] Intrinsic matrices
+        width: Image width
+        height: Image height
+    """
+    try:
+        from pycolmap import Reconstruction
+    except ImportError:
+        raise ImportError("pycolmap is required to load COLMAP data. Install with: pip install pycolmap")
+
+    import os
+
+    if not os.path.exists(colmap_sparse_path):
+        raise FileNotFoundError(f"COLMAP sparse directory not found: {colmap_sparse_path}")
+
+    # Load COLMAP data using Reconstruction
+    reconstruction = Reconstruction(colmap_sparse_path)
+
+    # Extract camera data
+    w2c_mats = []
+    Ks_list = []
+    image_names = []
+    camera_ids = []
+
+    bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
+
+    for image_id, image in reconstruction.images.items():
+        # Get world-to-camera transformation matrix
+        # cam_from_world() returns a Rigid3d object with rotation and translation
+        cam_from_world = image.cam_from_world()
+        rot = cam_from_world.rotation.matrix()  # 3x3 rotation matrix
+        trans = np.array(cam_from_world.translation).reshape(3, 1)  # 3x1 translation vector
+
+        # Build world-to-camera matrix
+        w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
+        w2c_mats.append(w2c)
+
+        # Get camera intrinsics
+        camera_id = image.camera_id
+        camera_ids.append(camera_id)
+        cam = reconstruction.cameras[camera_id]
+
+        fx, fy, cx, cy = cam.focal_length_x, cam.focal_length_y, cam.principal_point_x, cam.principal_point_y
+        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+        Ks_list.append(K)
+
+        # Store image name
+        image_names.append(image.name)
+
+    if len(w2c_mats) == 0:
+        raise ValueError(f"No images found in COLMAP reconstruction at {colmap_sparse_path}")
+
+    # Convert to numpy arrays
+    w2c_mats = np.stack(w2c_mats, axis=0)
+
+    # Convert world-to-camera to camera-to-world (this is what gsplat expects)
+    camtoworlds = np.linalg.inv(w2c_mats)
+
+    # Sort by image name for consistency
+    inds = np.argsort(image_names)
+    image_names = [image_names[i] for i in inds]
+    camtoworlds = camtoworlds[inds]
+    Ks_list = [Ks_list[i] for i in inds]
+    camera_ids = [camera_ids[i] for i in inds]
+
+    # Apply normalization if requested (to match training setup)
+    if normalize:
+        try:
+            import sys
+            # Add gsplat examples to path to import normalization functions
+            gsplat_examples_path = '/ssd1/haodongw/workspace/3dstream/gsplat/examples'
+            if gsplat_examples_path not in sys.path:
+                sys.path.insert(0, gsplat_examples_path)
+
+            from datasets.normalize import similarity_from_cameras, transform_cameras
+
+            # Note: 3D points are already loaded with the Reconstruction
+            points = reconstruction.points3D
+
+            print(f"  Normalizing world space (matching training setup)...")
+            # Apply similarity transform based on cameras
+            T1 = similarity_from_cameras(camtoworlds)
+            camtoworlds = transform_cameras(T1, camtoworlds)
+
+            print(f"    Applied normalization transform")
+        except (ImportError, Exception) as e:
+            print(f"  Warning: Could not apply normalization: {e}")
+            print(f"  Cameras will not be normalized. Results may not match training.")
+
+    # Limit to max_views if specified
+    if max_views is not None and max_views < len(camtoworlds):
+        camtoworlds = camtoworlds[:max_views]
+        Ks_list = Ks_list[:max_views]
+        image_names = image_names[:max_views]
+        camera_ids = camera_ids[:max_views]
+
+    # Get image dimensions from first camera
+    first_cam_id = camera_ids[0]
+    first_cam = reconstruction.cameras[first_cam_id]
+    width = int(first_cam.width)
+    height = int(first_cam.height)
+
+    # Convert to torch tensors
+    camtoworlds = torch.from_numpy(camtoworlds).float().to(device)
+    Ks = torch.from_numpy(np.stack(Ks_list)).float().to(device)
+
+    print(f"Loaded {len(camtoworlds)} cameras from COLMAP sparse reconstruction")
+    print(f"  Image size: {width}x{height}")
+    print(f"  First few images: {image_names[:min(5, len(image_names))]}")
+
+    return camtoworlds, Ks, width, height
+
+
+def load_cameras_from_calibration(
+    calibration_csv_path: str,
+    device: str = 'cuda',
+    max_views: int = None
+) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    """
+    Load camera parameters from ActorsHQ calibration CSV file.
+
+    The CSV format is:
+    name,w,h,rx,ry,rz,tx,ty,tz,fx,fy,px,py
+
+    Where:
+    - w, h: image width and height
+    - rx, ry, rz: rotation angles (Rodriguez vector)
+    - tx, ty, tz: translation
+    - fx, fy: focal lengths
+    - px, py: principal points (normalized to [0, 1])
+
+    Args:
+        calibration_csv_path: Path to calibration.csv file
+        device: Device to use
+        max_views: Maximum number of views to load (None = load all)
+
+    Returns:
+        camtoworlds: [n_views, 4, 4] Camera-to-world matrices
+        Ks: [n_views, 3, 3] Intrinsic matrices
+        width: Image width
+        height: Image height
+    """
+    import csv
+    import math
+
+    w2c_mats = []
+    Ks = []
+    widths = []
+    heights = []
+
+    with open(calibration_csv_path, 'r') as f:
+        reader = csv.DictReader(f)
+        for idx, row in enumerate(reader):
+            if max_views is not None and idx >= max_views:
+                break
+
+            # Parse dimensions
+            w = int(row['w'])
+            h = int(row['h'])
+            widths.append(w)
+            heights.append(h)
+
+            # Parse rotation (Rodriguez vector)
+            rx = float(row['rx'])
+            ry = float(row['ry'])
+            rz = float(row['rz'])
+
+            # Convert Rodriguez vector to rotation matrix
+            theta = math.sqrt(rx*rx + ry*ry + rz*rz)
+            if theta < 1e-10:
+                # No rotation
+                R = torch.eye(3, device=device)
+            else:
+                # Normalize axis
+                kx, ky, kz = rx/theta, ry/theta, rz/theta
+
+                # Rodriguez formula
+                ct = math.cos(theta)
+                st = math.sin(theta)
+                vt = 1 - ct
+
+                R = torch.tensor([
+                    [kx*kx*vt + ct,    kx*ky*vt - kz*st, kx*kz*vt + ky*st],
+                    [kx*ky*vt + kz*st, ky*ky*vt + ct,    ky*kz*vt - kx*st],
+                    [kx*kz*vt - ky*st, ky*kz*vt + kx*st, kz*kz*vt + ct]
+                ], device=device, dtype=torch.float32)
+
+            # Parse translation
+            t = torch.tensor([float(row['tx']), float(row['ty']), float(row['tz'])],
+                           device=device, dtype=torch.float32)
+
+            # Build world-to-camera matrix
+            w2c = torch.eye(4, device=device, dtype=torch.float32)
+            w2c[:3, :3] = R
+            w2c[:3, 3] = t
+            w2c_mats.append(w2c)
+
+            # Parse intrinsics
+            fx = float(row['fx'])
+            fy = float(row['fy'])
+            px = float(row['px'])  # Normalized [0, 1]
+            py = float(row['py'])  # Normalized [0, 1]
+
+            # Convert to pixel coordinates
+            cx = px * w
+            cy = py * h
+
+            K = torch.tensor([
+                [fx, 0, cx],
+                [0, fy, cy],
+                [0, 0, 1]
+            ], device=device, dtype=torch.float32)
+            Ks.append(K)
+
+    if len(w2c_mats) == 0:
+        raise ValueError(f"No cameras loaded from {calibration_csv_path}")
+
+    # Check that all images have the same dimensions
+    if len(set(widths)) > 1 or len(set(heights)) > 1:
+        print(f"Warning: Multiple image sizes found: widths={set(widths)}, heights={set(heights)}")
+        print(f"Using the most common size")
+        # Use the most common dimensions
+        from collections import Counter
+        width = Counter(widths).most_common(1)[0][0]
+        height = Counter(heights).most_common(1)[0][0]
+    else:
+        width = widths[0]
+        height = heights[0]
+
+    w2c_mats = torch.stack(w2c_mats)
+    Ks = torch.stack(Ks)
+
+    # Convert world-to-camera to camera-to-world
+    camtoworlds = torch.linalg.inv(w2c_mats)
+
+    print(f"Loaded {len(camtoworlds)} cameras from {calibration_csv_path}")
+    print(f"  Image size: {width}x{height}")
+
+    return camtoworlds, Ks, width, height
+
+
 def generate_random_cameras(
     center: torch.Tensor,
     radius: float,
@@ -222,7 +485,7 @@ def generate_random_cameras(
         device: Device to use
 
     Returns:
-        viewmats: [n_views, 4, 4] World-to-camera matrices
+        camtoworlds: [n_views, 4, 4] Camera-to-world matrices
         Ks: [n_views, 3, 3] Intrinsic matrices
         width: Image width
         height: Image height
@@ -230,7 +493,7 @@ def generate_random_cameras(
     import math
 
     # Generate random camera positions on a sphere
-    viewmats = []
+    w2c_mats = []
     for i in range(n_views):
         # Random spherical coordinates
         theta = torch.rand(1).item() * 2 * math.pi  # azimuth
@@ -264,9 +527,12 @@ def generate_random_cameras(
         w2c[2, :3] = forward  # Camera looks down +Z in camera space
         w2c[:3, 3] = -torch.mv(w2c[:3, :3], cam_pos)
 
-        viewmats.append(w2c)
+        w2c_mats.append(w2c)
 
-    viewmats = torch.stack(viewmats)
+    w2c_mats = torch.stack(w2c_mats)
+
+    # Convert world-to-camera to camera-to-world
+    camtoworlds = torch.linalg.inv(w2c_mats)
 
     # Create intrinsic matrix (simple pinhole model)
     focal = image_width * 1.2  # Reasonable FOV
@@ -277,7 +543,7 @@ def generate_random_cameras(
     ], device=device)
     Ks = K.unsqueeze(0).repeat(n_views, 1, 1)
 
-    return viewmats, Ks, image_width, image_height
+    return camtoworlds, Ks, image_width, image_height
 
 
 def render_gaussians(
@@ -286,7 +552,7 @@ def render_gaussians(
     scales: torch.Tensor,
     opacities: torch.Tensor,
     colors: torch.Tensor,
-    viewmats: torch.Tensor,
+    camtoworlds: torch.Tensor,
     Ks: torch.Tensor,
     width: int,
     height: int
@@ -300,7 +566,7 @@ def render_gaussians(
         scales: [N, 3] Scales
         opacities: [N] Opacities
         colors: [N, C] Colors (SH coefficients)
-        viewmats: [V, 4, 4] View matrices
+        camtoworlds: [V, 4, 4] Camera-to-world matrices
         Ks: [V, 3, 3] Intrinsic matrices
         width: Image width
         height: Image height
@@ -310,8 +576,11 @@ def render_gaussians(
     """
     import gsplat
 
-    n_views = viewmats.shape[0]
+    n_views = camtoworlds.shape[0]
     device = means.device
+
+    # Convert camtoworlds to viewmats (world-to-camera) for gsplat rasterization
+    viewmats = torch.linalg.inv(camtoworlds)
 
     # Scales should already be in linear space after exponentiation in test_voxelize_3dgs.py
 
@@ -375,48 +644,79 @@ def try_render_comparison(
     merged_params: Dict[str, torch.Tensor],
     n_views: int = 5,
     image_size: int = 512,
-    output_dir: str = None
+    output_dir: str = None,
+    calibration_csv_path: str = None,
+    colmap_path: str = None,
+    normalize: bool = False
 ) -> Dict[str, float]:
     """
-    Render both original and merged Gaussians from random views and compute PSNR.
+    Render both original and merged Gaussians from camera views and compute PSNR.
 
     Args:
         original_params: Dict with keys: means, quats, scales, opacities, colors
         merged_params: Dict with keys: means, quats, scales, opacities, colors
-        n_views: Number of random camera views to render
-        image_size: Image resolution (square images)
+        n_views: Number of camera views to render (only used if both calibration_csv_path and colmap_path are None)
+        image_size: Image resolution for random cameras (only used if both calibration_csv_path and colmap_path are None)
         output_dir: Optional directory to save rendered images
+        calibration_csv_path: Optional path to calibration CSV file with official camera views
+        colmap_path: Optional path to COLMAP sparse directory with official camera views
+        normalize: Whether to normalize COLMAP world space (should match training setting)
 
     Returns:
         Dictionary with PSNR metrics per view and average
     """
     try:
         import gsplat
-        print(f"\n{'=' * 80}")
-        print(f"Rendering comparison with {n_views} random camera views...")
-        print('=' * 80)
 
         device = original_params['means'].device
 
-        # Compute scene center and bounds from original Gaussians
-        center = original_params['means'].mean(dim=0)
-        bbox_size = (original_params['means'].max(dim=0)[0] -
-                     original_params['means'].min(dim=0)[0]).max().item()
-        radius = bbox_size * 1.5  # Camera distance from center
+        if colmap_path is not None:
+            # Load official camera views from COLMAP sparse reconstruction
+            print(f"\n{'=' * 80}")
+            print(f"Rendering comparison with official camera views from COLMAP...")
+            print('=' * 80)
 
-        print(f"  Scene center: {center.cpu().numpy()}")
-        print(f"  Scene size: {bbox_size:.4f}")
-        print(f"  Camera radius: {radius:.4f}")
+            camtoworlds, Ks, width, height = load_cameras_from_colmap(
+                colmap_sparse_path=colmap_path,
+                device=device,
+                max_views=n_views,
+                normalize=normalize
+            )
+        elif calibration_csv_path is not None:
+            # Load official camera views from calibration CSV
+            print(f"\n{'=' * 80}")
+            print(f"Rendering comparison with official camera views from calibration...")
+            print('=' * 80)
 
-        # Generate random camera views
-        viewmats, Ks, width, height = generate_random_cameras(
-            center=center,
-            radius=radius,
-            n_views=n_views,
-            image_width=image_size,
-            image_height=image_size,
-            device=device
-        )
+            camtoworlds, Ks, width, height = load_cameras_from_calibration(
+                calibration_csv_path=calibration_csv_path,
+                device=device,
+                max_views=n_views
+            )
+        else:
+            # Generate random camera views
+            print(f"\n{'=' * 80}")
+            print(f"Rendering comparison with {n_views} random camera views...")
+            print('=' * 80)
+
+            # Compute scene center and bounds from original Gaussians
+            center = original_params['means'].mean(dim=0)
+            bbox_size = (original_params['means'].max(dim=0)[0] -
+                         original_params['means'].min(dim=0)[0]).max().item()
+            radius = bbox_size * 1.5  # Camera distance from center
+
+            print(f"  Scene center: {center.cpu().numpy()}")
+            print(f"  Scene size: {bbox_size:.4f}")
+            print(f"  Camera radius: {radius:.4f}")
+
+            camtoworlds, Ks, width, height = generate_random_cameras(
+                center=center,
+                radius=radius,
+                n_views=n_views,
+                image_width=image_size,
+                image_height=image_size,
+                device=device
+            )
 
         print(f"\n  Rendering original Gaussians ({original_params['means'].shape[0]} points)...")
         torch.cuda.synchronize()
@@ -428,7 +728,7 @@ def try_render_comparison(
             scales=original_params['scales'],
             opacities=original_params['opacities'],
             colors=original_params['colors'],
-            viewmats=viewmats,
+            camtoworlds=camtoworlds,
             Ks=Ks,
             width=width,
             height=height
@@ -448,7 +748,7 @@ def try_render_comparison(
             scales=merged_params['scales'],
             opacities=merged_params['opacities'],
             colors=merged_params['colors'],
-            viewmats=viewmats,
+            camtoworlds=camtoworlds,
             Ks=Ks,
             width=width,
             height=height
@@ -465,19 +765,46 @@ def try_render_comparison(
         print(f"    Merged images: min={merged_images.min().item():.4f}, max={merged_images.max().item():.4f}, mean={merged_images.mean().item():.4f}")
 
         psnrs = []
+        inf_views = []
         for i in range(n_views):
             mse = torch.mean((original_images[i] - merged_images[i]) ** 2).item()
             psnr = compute_psnr(original_images[i], merged_images[i])
             psnrs.append(psnr)
-            print(f"    View {i+1}: MSE={mse:.6e}, PSNR={psnr:.2f} dB")
 
-        avg_psnr = np.mean(psnrs)
-        std_psnr = np.std(psnrs)
-        min_psnr = np.min(psnrs)
-        max_psnr = np.max(psnrs)
+            if np.isinf(psnr):
+                inf_views.append(i + 1)
+                # Check if the view is mostly background (close to 1.0 for white background)
+                avg_intensity = original_images[i].mean().item()
+                if avg_intensity > 0.95:
+                    print(f"    View {i+1}: MSE={mse:.6e}, PSNR=inf dB (mostly background, avg={avg_intensity:.3f})")
+                else:
+                    print(f"    View {i+1}: MSE={mse:.6e}, PSNR=inf dB (identical images, avg={avg_intensity:.3f})")
+            else:
+                print(f"    View {i+1}: MSE={mse:.6e}, PSNR={psnr:.2f} dB")
 
-        print(f"\n  Average PSNR: {avg_psnr:.2f} ± {std_psnr:.2f} dB")
-        print(f"  Range: [{min_psnr:.2f}, {max_psnr:.2f}] dB")
+        # Handle infinite PSNR values in statistics
+        psnrs_array = np.array(psnrs)
+        finite_psnrs = psnrs_array[np.isfinite(psnrs_array)]
+
+        if len(inf_views) > 0:
+            print(f"\n  Note: {len(inf_views)} view(s) have infinite PSNR (identical renders): {inf_views}")
+
+        if len(finite_psnrs) > 0:
+            avg_psnr = np.mean(finite_psnrs)
+            std_psnr = np.std(finite_psnrs)
+            min_psnr = np.min(finite_psnrs)
+            max_psnr = np.max(finite_psnrs)
+
+            print(f"\n  PSNR statistics (excluding {len(inf_views)} infinite values):")
+            print(f"    Average: {avg_psnr:.2f} ± {std_psnr:.2f} dB")
+            print(f"    Range: [{min_psnr:.2f}, {max_psnr:.2f}] dB")
+            print(f"    Valid views: {len(finite_psnrs)}/{n_views}")
+        else:
+            print(f"\n  All views have infinite PSNR (all renders identical)")
+            avg_psnr = float('inf')
+            std_psnr = 0.0
+            min_psnr = float('inf')
+            max_psnr = float('inf')
 
         # Save rendered images if output directory is specified
         if output_dir is not None:
@@ -510,6 +837,9 @@ def try_render_comparison(
             'psnr_min': min_psnr,
             'psnr_max': max_psnr,
             'psnr_per_view': psnrs,
+            'n_views': n_views,
+            'n_finite_views': len(finite_psnrs) if len(finite_psnrs) > 0 else n_views,
+            'n_inf_views': len(inf_views),
             'original_render_time_ms': original_time * 1000,
             'merged_render_time_ms': merged_time * 1000,
         }

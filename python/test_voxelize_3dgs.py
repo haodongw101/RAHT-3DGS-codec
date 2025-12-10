@@ -157,7 +157,7 @@ def warmup_cuda_kernels(params, J, device):
     torch.cuda.synchronize()
 
 
-def compress_to_nvox(ckpt_path, J=10, output_dir="output_compressed", device='cuda'):
+def compress_to_nvox(ckpt_path, J=10, output_dir="output_compressed", device='cuda', calibration_csv_path=None, colmap_path=None, normalize=False):
     """
     Compress 3DGS from N to Nvox Gaussians.
 
@@ -172,6 +172,9 @@ def compress_to_nvox(ckpt_path, J=10, output_dir="output_compressed", device='cu
         J: Octree depth for voxelization
         output_dir: Directory to save output PLY files
         device: CUDA device to use (e.g., 'cuda', 'cuda:0', 'cuda:1')
+        calibration_csv_path: Optional path to calibration CSV file with official camera views
+        colmap_path: Optional path to COLMAP sparse directory with official camera views
+        normalize: Whether to normalize COLMAP world space (should match training setting)
     """
     print("=" * 80)
     print("3DGS Compression: N → Nvox Gaussians")
@@ -285,7 +288,7 @@ def compress_to_nvox(ckpt_path, J=10, output_dir="output_compressed", device='cu
     compressed_ply_path = os.path.join(output_dir, "compressed_Nvox_gaussians.ply")
     save_ply(compressed_ply_path, voxel_positions_int, merged_quats, merged_scales,
              merged_opacities, merged_colors,
-             voxel_size=voxel_info['voxel_size'], vmin=voxel_info['vmin'])
+             voxel_size=voxel_info['voxel_size'], vmin=voxel_info['vmin'], octree_depth=J)
 
     # 5. File size comparison
     import os as os_module
@@ -325,12 +328,82 @@ def compress_to_nvox(ckpt_path, J=10, output_dir="output_compressed", device='cu
     }
 
     render_output_dir = os.path.join(output_dir, "renders")
+    
+    if calibration_csv_path is not None or colmap_path is not None:
+        n_views = 160  # ActorsHQ has 160 cameras total
+    else:
+        # Use random views if no calibration provided
+        n_views = 50
+
     rendering_metrics = try_render_comparison(
         original_params,
         compressed_params,
-        n_views=50,
-        output_dir=render_output_dir
+        n_views=n_views,
+        output_dir=render_output_dir,
+        calibration_csv_path=calibration_csv_path,
+        colmap_path=colmap_path,
+        normalize=normalize
     )
+
+    # Save evaluation statistics to output directory
+    stats_path = os.path.join(output_dir, "evaluation_stats.txt")
+    with open(stats_path, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write("3DGS VOXELIZATION AND COMPRESSION EVALUATION\n")
+        f.write("=" * 80 + "\n\n")
+
+        f.write(f"Checkpoint: {ckpt_path}\n")
+        f.write(f"Octree Depth (J): {J}\n")
+        f.write(f"Voxel Size: {voxel_info['voxel_size']:.6f}\n\n")
+
+        f.write("COMPRESSION STATISTICS\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"Original Gaussians:   {N:,}\n")
+        f.write(f"Compressed Gaussians: {Nvox:,}\n")
+        f.write(f"Compression Ratio:    {N / Nvox:.2f}x\n\n")
+
+        f.write("TIMING STATISTICS (ms)\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"Voxelization:         {voxel_elapsed_time * 1000:.2f} (GPU wait: {voxel_sync_time * 1000:.2f})\n")
+        f.write(f"Cluster Construction: {cluster_elapsed_time * 1000:.2f} (GPU wait: {cluster_sync_time * 1000:.2f})\n")
+        f.write(f"Attribute Merging:    {merge_elapsed_time * 1000:.2f} (GPU wait: {merge_sync_time * 1000:.2f})\n")
+        f.write(f"Total Time:           {compression_elapsed_time * 1000:.2f}\n\n")
+
+        f.write("FILE SIZE STATISTICS\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"Original PLY:     {original_size / 1024 / 1024:.2f} MB\n")
+        f.write(f"Compressed PLY:   {compressed_size / 1024 / 1024:.2f} MB\n")
+        f.write(f"Size Reduction:   {size_reduction:.1f}%\n\n")
+
+        if rendering_metrics:
+            f.write("RENDERING QUALITY METRICS\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"Number of Views:      {rendering_metrics.get('n_views', 'N/A')}\n")
+
+            if 'n_inf_views' in rendering_metrics and rendering_metrics['n_inf_views'] > 0:
+                f.write(f"Views with Inf PSNR:  {rendering_metrics['n_inf_views']}\n")
+                f.write(f"Valid Views:          {rendering_metrics.get('n_finite_views', 'N/A')}\n")
+
+            if not isinstance(rendering_metrics['psnr_avg'], float) or not float('inf') == rendering_metrics['psnr_avg']:
+                f.write(f"\nPSNR (dB):\n")
+                f.write(f"  Average:  {rendering_metrics['psnr_avg']:.2f} ± {rendering_metrics['psnr_std']:.2f}\n")
+                f.write(f"  Range:    [{rendering_metrics['psnr_min']:.2f}, {rendering_metrics['psnr_max']:.2f}]\n")
+            else:
+                f.write(f"\nPSNR: All views identical (inf)\n")
+
+            f.write(f"\nRendering Time (ms):\n")
+            f.write(f"  Original:   {rendering_metrics.get('original_render_time_ms', 'N/A'):.2f}\n")
+            f.write(f"  Compressed: {rendering_metrics.get('merged_render_time_ms', 'N/A'):.2f}\n")
+
+        f.write("\n" + "=" * 80 + "\n")
+        f.write("OUTPUT FILES\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Original PLY:     {original_ply_path}\n")
+        f.write(f"Compressed PLY:   {compressed_ply_path}\n")
+        f.write(f"Renders:          {render_output_dir}/\n")
+        f.write(f"Statistics:       {stats_path}\n")
+
+    print(f"\n📊 Evaluation statistics saved to: {stats_path}")
 
     return {
         'original_count': N,
@@ -349,20 +422,25 @@ def compress_to_nvox(ckpt_path, J=10, output_dir="output_compressed", device='cu
         'rendering_metrics': rendering_metrics,
         'original_ply_path': original_ply_path,
         'compressed_ply_path': compressed_ply_path,
+        'stats_path': stats_path,
     }
 
 
 if __name__ == '__main__':
     logger, log_path = _init_logger()
     ckpt_path = "/ssd1/rajrup/Project/gsplat/results/actorshq_l1_0.5_ssim_0.5_alpha_1.0/Actor01/Sequence1/resolution_4/0/ckpts/ckpt_29999_rank0.pt"
-    J = 10
-    
+    colmap_path = "/ssd1/rajrup/Project/gsplat/data/Actor01/Sequence1/0/resolution_4/sparse"
+    normalize = True
+    J = 15
+
     try:
         results = compress_to_nvox(
             ckpt_path,
             J,
-            output_dir="output_compressed",
-            device="cuda:0"  # Change to "cuda:0", "cuda:1", etc. to use a specific GPU
+            output_dir=f"output_voxelized_J{J}",
+            device="cuda:0",  # Change to "cuda:0", "cuda:1", etc. to use a specific GPU
+            colmap_path=colmap_path,
+            normalize=normalize
         )
 
         print("\n" + "=" * 80)
