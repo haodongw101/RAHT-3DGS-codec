@@ -48,6 +48,7 @@ def get_pointcloud_n_frames(dataset: str, sequence: str) -> Optional[int]:
     
     return end_frame - start_frame + 1
 
+
 def ply_read_8i(filename: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Reads vertex and color data from a .ply file from the 8iVFBv2 dataset.
@@ -125,6 +126,71 @@ def ply_read_mvub(filename: str) -> Tuple[torch.Tensor, torch.Tensor]:
     C = torch.from_numpy(data[:, 3:6]).int()
     
     return V, C
+
+
+def get_pointcloud(dataset: str, sequence: str, frame: int, data_root: str = '.') -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """
+    Retrieves a point cloud for a specific frame from a given dataset and sequence.
+
+    Args:
+        dataset (str): The name of the dataset ('8iVFBv2' or 'MVUB').
+        sequence (str): The name of the sequence (e.g., 'soldier', 'andrew9').
+        frame (int): The desired frame number (1-based index).
+        data_root (str): The root directory where datasets are stored. Defaults to '.'.
+
+    Returns:
+        Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+            - V (torch.Tensor): An (N, 3) tensor of vertex coordinates.
+            - C (torch.Tensor): An (N, 3) tensor of vertex colors.
+            - J (int): voxel depth.
+            Returns None if an error occurs.
+    """
+    if dataset not in DATASET_CONFIG:
+        warnings.warn(f"'{dataset}' is not a valid dataset name.")
+        return None
+        
+    if sequence not in DATASET_CONFIG[dataset]:
+        warnings.warn(f"The sequence '{sequence}' does not belong in dataset '{dataset}'.")
+        return None
+
+    seq_info = DATASET_CONFIG[dataset][sequence]
+    start_frame = seq_info['start']
+    end_frame = seq_info['end']
+    
+    get_frame = start_frame - 1 + frame
+    
+    if not (start_frame <= get_frame <= end_frame):
+        warnings.warn(f"The frame number {frame} (calculates to {get_frame}) is out of the valid range [{start_frame}, {end_frame}].")
+        return None
+        
+    filename = ""
+    try:
+        if dataset == '8iVFBv2':
+            filename = os.path.join(
+                data_root, '8iVFBv2', sequence, 'Ply', f'{sequence}_vox10_{get_frame:04d}.ply'
+            )
+            V, C, J = ply_read_8i(filename)
+        
+        elif dataset == 'MVUB':
+            filename = os.path.join(
+                data_root, 'MVUB', sequence, 'ply', f'frame{get_frame:04d}.ply'
+            )
+            V, C = ply_read_mvub(filename)
+            J = 9
+        
+        else:
+            return None
+            
+        return V, C, J
+
+    except FileNotFoundError:
+        warnings.warn(f"File not found at path: {filename}")
+        return None
+    except Exception as e:
+        warnings.warn(f"An error occurred while processing {filename}: {e}")
+        return None
+
+
 
 def read_ply_file(filename: str) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """
@@ -382,67 +448,238 @@ def read_compressed_3dgs_ply(filename: str) -> Optional[Tuple[torch.Tensor, torc
         return None
 
 
-def get_pointcloud(dataset: str, sequence: str, frame: int, data_root: str = '.') -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+
+def load_pt_gaussians(path, device='cuda'):
     """
-    Retrieves a point cloud for a specific frame from a given dataset and sequence.
+    Load Gaussian parameters from PyTorch checkpoint (.pt file).
+
+    Internal helper function for load_3dgs.
 
     Args:
-        dataset (str): The name of the dataset ('8iVFBv2' or 'MVUB').
-        sequence (str): The name of the sequence (e.g., 'soldier', 'andrew9').
-        frame (int): The desired frame number (1-based index).
-        data_root (str): The root directory where datasets are stored. Defaults to '.'.
+        path (str): Path to .pt checkpoint file
+        device (str): Device to load tensors to
 
     Returns:
-        Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-            - V (torch.Tensor): An (N, 3) tensor of vertex coordinates.
-            - C (torch.Tensor): An (N, 3) tensor of vertex colors.
-            - J (int): voxel depth.
-            Returns None if an error occurs.
+        dict: Dictionary with keys: means, quats, scales, opacities, colors, metadata
     """
-    if dataset not in DATASET_CONFIG:
-        warnings.warn(f"'{dataset}' is not a valid dataset name.")
-        return None
-        
-    if sequence not in DATASET_CONFIG[dataset]:
-        warnings.warn(f"The sequence '{sequence}' does not belong in dataset '{dataset}'.")
-        return None
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
 
-    seq_info = DATASET_CONFIG[dataset][sequence]
-    start_frame = seq_info['start']
-    end_frame = seq_info['end']
-    
-    get_frame = start_frame - 1 + frame
-    
-    if not (start_frame <= get_frame <= end_frame):
-        warnings.warn(f"The frame number {frame} (calculates to {get_frame}) is out of the valid range [{start_frame}, {end_frame}].")
-        return None
-        
-    filename = ""
-    try:
-        if dataset == '8iVFBv2':
-            filename = os.path.join(
-                data_root, '8iVFBv2', sequence, 'Ply', f'{sequence}_vox10_{get_frame:04d}.ply'
-            )
-            V, C, J = ply_read_8i(filename)
-        
-        elif dataset == 'MVUB':
-            filename = os.path.join(
-                data_root, 'MVUB', sequence, 'ply', f'frame{get_frame:04d}.ply'
-            )
-            V, C = ply_read_mvub(filename)
-            J = 9
-        
+    if 'splats' not in checkpoint:
+        raise ValueError("Checkpoint does not contain 'splats' key")
+
+    splats = checkpoint['splats']
+    params = {}
+
+    # Extract means (positions)
+    if 'means' not in splats:
+        raise ValueError("Missing 'means' in splats")
+    params['means'] = splats['means'].to(device).float()
+
+    # Extract quaternions (rotations)
+    if 'quats' not in splats:
+        raise ValueError("Missing 'quats' in splats")
+    params['quats'] = splats['quats'].to(device).float()
+    # Normalize quaternions
+    params['quats'] = params['quats'] / params['quats'].norm(dim=1, keepdim=True)
+
+    # Extract scales
+    if 'scales' not in splats:
+        raise ValueError("Missing 'scales' in splats")
+    params['scales'] = splats['scales'].to(device).float()
+    # Scales might be in log space, exponentiate if needed
+    if params['scales'].min() < 0:
+        params['scales'] = torch.exp(params['scales'])
+
+    # Extract opacities
+    if 'opacities' not in splats:
+        raise ValueError("Missing 'opacities' in splats")
+    params['opacities'] = splats['opacities'].to(device).float().squeeze()
+    # Opacities might be in logit space, apply sigmoid if needed
+    if params['opacities'].min() < 0 or params['opacities'].max() > 1:
+        params['opacities'] = torch.sigmoid(params['opacities'])
+
+    # Extract colors from SH coefficients
+    if 'sh0' in splats:
+        sh0 = splats['sh0'].to(device).float()
+        # Flatten if needed (e.g., [N, 3, 1] -> [N, 3])
+        if sh0.ndim > 2:
+            sh0 = sh0.reshape(sh0.shape[0], -1)
+
+        if 'shN' in splats and splats['shN'] is not None:
+            shN = splats['shN'].to(device).float()
+            # Flatten if needed
+            if shN.ndim > 2:
+                shN = shN.reshape(shN.shape[0], -1)
+            # Concatenate sh0 and shN
+            params['colors'] = torch.cat([sh0, shN], dim=1)
         else:
-            return None
-            
-        return V, C, J
+            # Only use sh0 if shN is not available
+            params['colors'] = sh0
+    else:
+        raise ValueError("Missing 'sh0' in splats")
 
-    except FileNotFoundError:
-        warnings.warn(f"File not found at path: {filename}")
-        return None
-    except Exception as e:
-        warnings.warn(f"An error occurred while processing {filename}: {e}")
-        return None
+    params['metadata'] = {'source': 'checkpoint'}
+
+    print(f"Loaded {params['means'].shape[0]} Gaussians from checkpoint")
+
+    return params
+
+def load_ply_gaussians(path, device='cuda'):
+    """
+    Load standard 3DGS PLY file with original Gaussian parameters.
+
+    PLY format (binary little endian):
+        x, y, z (positions)
+        f_dc_0, f_dc_1, f_dc_2 (SH DC components - sh0)
+        f_rest_0, ... f_rest_N (SH rest components - shN)
+        opacity
+        scale_0, scale_1, scale_2 (scales)
+        rot_0, rot_1, rot_2, rot_3 (quaternions)
+
+    Args:
+        path (str): Path to PLY file
+        device (str): Device to load tensors to
+
+    Returns:
+        dict: Dictionary with keys: means, quats, scales, opacities, colors, metadata
+    """
+    import struct
+    import numpy as np
+
+    print(f"Loading 3DGS from PLY: {path}")
+
+    with open(path, 'rb') as f:
+        # Read header
+        header_lines = []
+        while True:
+            line = f.readline().decode('ascii').strip()
+            header_lines.append(line)
+            if line == 'end_header':
+                break
+
+        # Parse header
+        num_vertices = 0
+        is_binary = False
+        properties = []
+
+        for line in header_lines:
+            if line.startswith('format'):
+                if 'binary' in line:
+                    is_binary = True
+            elif line.startswith('element vertex'):
+                num_vertices = int(line.split()[-1])
+            elif line.startswith('property'):
+                parts = line.split()
+                prop_type = parts[1]
+                prop_name = parts[2]
+                properties.append((prop_name, prop_type))
+
+        if num_vertices == 0:
+            raise ValueError("Could not find vertex count in PLY header")
+
+        if not is_binary:
+            raise ValueError("Only binary PLY format is supported for standard 3DGS files")
+
+        # Determine property layout
+        # Standard format: x, y, z, f_dc_*, f_rest_*, opacity, scale_*, rot_*
+        n_dc = sum(1 for name, _ in properties if name.startswith('f_dc_'))
+        n_rest = sum(1 for name, _ in properties if name.startswith('f_rest_'))
+        n_sh_total = n_dc + n_rest
+
+        # Read binary data
+        # All properties are float32 in standard 3DGS PLY format
+        bytes_per_vertex = len(properties) * 4  # 4 bytes per float32
+        data_bytes = f.read(bytes_per_vertex * num_vertices)
+
+        # Parse binary data
+        data = np.frombuffer(data_bytes, dtype=np.float32).reshape(num_vertices, -1)
+
+        # Extract components based on property order
+        idx = 0
+        # Positions (x, y, z)
+        means = torch.from_numpy(data[:, idx:idx+3]).float().to(device)
+        idx += 3
+
+        # SH coefficients (f_dc_* and f_rest_*)
+        colors = torch.from_numpy(data[:, idx:idx+n_sh_total]).float().to(device)
+        idx += n_sh_total
+
+        # Opacity
+        opacities = torch.from_numpy(data[:, idx]).float().to(device)
+        idx += 1
+
+        # Scales (scale_0, scale_1, scale_2)
+        scales = torch.from_numpy(data[:, idx:idx+3]).float().to(device)
+        idx += 3
+
+        # Quaternions (rot_0, rot_1, rot_2, rot_3)
+        quats = torch.from_numpy(data[:, idx:idx+4]).float().to(device)
+        idx += 4
+
+        # Normalize quaternions
+        quats = quats / quats.norm(dim=1, keepdim=True)
+
+        # Convert opacities from logit space if needed
+        if opacities.min() < 0 or opacities.max() > 1:
+            opacities = torch.sigmoid(opacities)
+
+        # Convert scales from log space if needed
+        if scales.min() < 0:
+            scales = torch.exp(scales)
+
+        print(f"Loaded {num_vertices} Gaussians from standard PLY")
+        print(f"  SH coefficients: {n_sh_total} (DC: {n_dc}, rest: {n_rest})")
+
+        return {
+            'means': means,
+            'quats': quats,
+            'scales': scales,
+            'opacities': opacities,
+            'colors': colors,
+            'metadata': {
+                'source': 'standard_ply',
+                'n_sh': n_sh_total
+            }
+        }
+
+def load_3dgs(path, device='cuda'):
+    """
+    Load 3DGS from either checkpoint (.pt) or PLY file (.ply).
+
+    Args:
+        path (str): Path to either a .pt checkpoint or .ply file
+        device (str): Device to load the tensors to (default: 'cuda')
+
+    Returns:
+        dict: Dictionary containing Gaussian parameters with keys:
+            - 'means': Nx3 tensor of positions
+            - 'quats': Nx4 tensor of quaternions (normalized)
+            - 'scales': Nx3 tensor of scales
+            - 'opacities': N tensor of opacities
+            - 'colors': NxC tensor of SH coefficients
+            - 'metadata': Optional dict with additional info (for PLY files)
+    """
+    import os
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File not found: {path}")
+
+    file_ext = os.path.splitext(path)[1].lower()
+
+    if file_ext == '.pt':
+        # Load from checkpoint
+        return load_pt_gaussians(path, device=device)
+
+    elif file_ext == '.ply':
+        # Load from standard 3DGS PLY file
+        try:
+            return load_ply_gaussians(path, device=device)
+        except Exception as e:
+            print(f"Failed to load as standard 3DGS PLY: {e}")
+            raise RuntimeError(f"Failed to load PLY file: {path}") from e
+
+    else:
+        raise ValueError(f"Unsupported file format: {file_ext}. Expected .pt or .ply")
 
 
 if __name__ == '__main__':

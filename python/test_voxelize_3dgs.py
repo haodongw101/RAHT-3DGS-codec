@@ -18,6 +18,7 @@ import logging
 from merge_cluster_cuda import merge_gaussian_clusters_with_indices
 
 # Import from local python directory
+from utils import load_3dgs, extract_gaussian_params
 from voxelize_pc import voxelize_pc_batched
 from quality_eval import (
     save_ply,
@@ -46,72 +47,6 @@ def _init_logger():
         "Original_size_mb,Compressed_size_mb,Size_reduction_percent"
     )
     return logger, log_path
-
-
-def load_3dgs_checkpoint(ckpt_path, device='cuda'):
-    """Load 3DGS checkpoint and extract Gaussian parameters."""
-    print(f"Loading checkpoint from: {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
-    return checkpoint
-
-
-def extract_gaussian_params(checkpoint, device='cuda'):
-    """Extract Gaussian parameters from checkpoint."""
-    if 'splats' not in checkpoint:
-        raise ValueError("Checkpoint does not contain 'splats' key")
-
-    splats = checkpoint['splats']
-    params = {}
-
-    # Extract means (positions)
-    if 'means' not in splats:
-        raise ValueError("Missing 'means' in splats")
-    params['means'] = splats['means'].to(device).float()
-
-    # Extract quaternions (rotations)
-    if 'quats' not in splats:
-        raise ValueError("Missing 'quats' in splats")
-    params['quats'] = splats['quats'].to(device).float()
-    # Normalize quaternions
-    params['quats'] = params['quats'] / params['quats'].norm(dim=1, keepdim=True)
-
-    # Extract scales
-    if 'scales' not in splats:
-        raise ValueError("Missing 'scales' in splats")
-    params['scales'] = splats['scales'].to(device).float()
-    # Scales might be in log space, exponentiate if needed
-    if params['scales'].min() < 0:
-        params['scales'] = torch.exp(params['scales'])
-
-    # Extract opacities
-    if 'opacities' not in splats:
-        raise ValueError("Missing 'opacities' in splats")
-    params['opacities'] = splats['opacities'].to(device).float().squeeze()
-    # Opacities might be in logit space, apply sigmoid if needed
-    if params['opacities'].min() < 0 or params['opacities'].max() > 1:
-        params['opacities'] = torch.sigmoid(params['opacities'])
-
-    # Extract colors from SH coefficients
-    if 'sh0' in splats:
-        sh0 = splats['sh0'].to(device).float()
-        # Flatten if needed (e.g., [N, 3, 1] -> [N, 3])
-        if sh0.ndim > 2:
-            sh0 = sh0.reshape(sh0.shape[0], -1)
-
-        if 'shN' in splats and splats['shN'] is not None:
-            shN = splats['shN'].to(device).float()
-            # Flatten if needed
-            if shN.ndim > 2:
-                shN = shN.reshape(shN.shape[0], -1)
-            # Concatenate sh0 and shN
-            params['colors'] = torch.cat([sh0, shN], dim=1)
-        else:
-            # Only use sh0 if shN is not available
-            params['colors'] = sh0
-    else:
-        raise ValueError("Missing 'sh0' in splats")
-
-    return params
 
 
 def warmup_cuda_kernels(params, J, device):
@@ -157,7 +92,7 @@ def warmup_cuda_kernels(params, J, device):
     torch.cuda.synchronize()
 
 
-def compress_to_nvox(ckpt_path, J=10, output_dir="output_compressed", device='cuda', calibration_csv_path=None, colmap_path=None, normalize=False):
+def compress_to_nvox(ckpt_path, J=10, output_dir="output_compressed", device='cuda', colmap_path=None, normalize=False):
     """
     Compress 3DGS from N to Nvox Gaussians.
 
@@ -172,7 +107,6 @@ def compress_to_nvox(ckpt_path, J=10, output_dir="output_compressed", device='cu
         J: Octree depth for voxelization
         output_dir: Directory to save output PLY files
         device: CUDA device to use (e.g., 'cuda', 'cuda:0', 'cuda:1')
-        calibration_csv_path: Optional path to calibration CSV file with official camera views
         colmap_path: Optional path to COLMAP sparse directory with official camera views
         normalize: Whether to normalize COLMAP world space (should match training setting)
     """
@@ -181,10 +115,8 @@ def compress_to_nvox(ckpt_path, J=10, output_dir="output_compressed", device='cu
     print("=" * 80)
     print(f"Using device: {device}")
 
-    # Load checkpoint and extract parameters
-    checkpoint = load_3dgs_checkpoint(ckpt_path, device=device)
-    params = extract_gaussian_params(checkpoint, device=device)
-
+    # Load 3DGS parameters
+    params = load_3dgs(ckpt_path, device=device)
     N = params['means'].shape[0]
     print(f"Number of Gaussians: {N}")
 
@@ -328,8 +260,8 @@ def compress_to_nvox(ckpt_path, J=10, output_dir="output_compressed", device='cu
     }
 
     render_output_dir = os.path.join(output_dir, "renders")
-    
-    if calibration_csv_path is not None or colmap_path is not None:
+
+    if colmap_path is not None:
         n_views = 160  # ActorsHQ has 160 cameras total
     else:
         # Use random views if no calibration provided
@@ -340,7 +272,6 @@ def compress_to_nvox(ckpt_path, J=10, output_dir="output_compressed", device='cu
         compressed_params,
         n_views=n_views,
         output_dir=render_output_dir,
-        calibration_csv_path=calibration_csv_path,
         colmap_path=colmap_path,
         normalize=normalize
     )
