@@ -1,6 +1,7 @@
 results/
 python/__pycache__/
 data/
+python/output_*
 
 .idea/
 .vscode/
