@@ -26,7 +26,7 @@ raht_fn = {
     "RAHT_param": RAHT_param_reorder_fast
 }
 
-ply_list = ['/ssd1/haodongw/workspace/3dstream/raht-3dgs-codec/python/output_compressed/compressed_Nvox_gaussians.ply']
+ply_list = ['/ssd1/haodongw/workspace/3dstream/raht-3dgs-codec/python/output_voxelized_J15/compressed_Nvox_gaussians.ply']
 J = 10
 T = len(ply_list)
 colorStep = [1, 4, 8, 12, 16, 20, 24, 32, 64]
@@ -127,7 +127,7 @@ for frame_idx in range(T):
     frame = frame_idx + 1
 
     V_quantized, attributes, voxel_size, vmin = read_compressed_3dgs_ply(ply_list[frame_idx])
-    print(f"Loaded PLY: {V_quantized.shape[0]} Gaussians")
+    print(f"Loaded 3D Gaussians: {V_quantized.shape[0]} Gaussians")
     print(f"  Integer positions shape: {V_quantized.shape}, range: [{V_quantized.min()}, {V_quantized.max()}]")
     print(f"  Attributes shape: {attributes.shape}")
     print(f"  Voxel metadata: voxel_size={voxel_size:.6f}, vmin={vmin.tolist()}")

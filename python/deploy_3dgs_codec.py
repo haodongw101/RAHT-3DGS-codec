@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-3DGS Deployment Codec: Lossless RAHT testing pipeline.
+3DGS Deployment Codec: 3DGS -> Voxelization + RAHT Compression + Decompression Pipeline
 
 Workflow:
 1. Load checkpoint and extract Gaussian parameters
@@ -16,22 +16,19 @@ Workflow:
    - Compare Step 2 merged vs Final (verifies lossless RAHT)
    - Compare Original vs Final (overall pipeline quality)
 
-NOTE: Currently testing lossless RAHT path (no quantization/entropy coding).
-This verifies RAHT correctness before adding lossy compression.
 """
 
 import torch
 import os
 import numpy as np
+import subprocess
+import io
 
-# Import from test_compress_to_nvox
 from merge_cluster_cuda import merge_gaussian_clusters_with_indices
 from voxelize_pc import voxelize_pc_batched
 from quality_eval import save_ply, try_render_comparison
 from data_util import load_3dgs
 
-# Import from encode_3dgs
-from utils import rgb_to_yuv
 from RAHT import RAHT2_optimized
 from iRAHT import inverse_RAHT
 from RAHT_param import RAHT_param
@@ -45,7 +42,7 @@ def deploy_compress_decompress(
     output_dir="output_deployment",
     device='cuda',
     n_eval_views=50,
-    require_lossless_raht=True
+    use_position_codec=True
 ):
     """
     Complete deployment pipeline: compress and decompress 3DGS.
@@ -58,6 +55,7 @@ def deploy_compress_decompress(
         device: CUDA device to use
         n_eval_views: Number of views for PSNR evaluation
         require_lossless_raht: If True, raise error if RAHT is not lossless (default: True)
+        use_position_codec: If True, compress/decompress positions with GPU Octree codec (default: True)
 
     Returns:
         Dictionary with compression results and metrics
@@ -68,6 +66,10 @@ def deploy_compress_decompress(
     print(f"Device: {device}")
     print(f"Octree depth J: {J}")
     print(f"Color quantization step: {color_step}")
+    print(f"Position codec: {'ENABLED (GPU Octree)' if use_position_codec else 'DISABLED'}")
+
+    # Prepare output directory for any saved artifacts
+    os.makedirs(output_dir, exist_ok=True)
 
     # ========== STEP 1: Load and prepare data ==========
     print("\n" + "=" * 80)
@@ -75,9 +77,7 @@ def deploy_compress_decompress(
     print("=" * 80)
 
     params = load_3dgs(ckpt_path, device=device)
-
     N = params['means'].shape[0]
-    print(f"Number of original Gaussians: {N}")
 
     # ========== STEP 2: Voxelize and merge ==========
     print("\n" + "=" * 80)
@@ -115,72 +115,87 @@ def deploy_compress_decompress(
         )
 
     # Get quantized voxel positions (integer coordinates)
-    voxel_positions_int = PCvox[:, :3]  # [Nvox, 3] integer coordinates
+    V = PCvox[:, :3]  # [Nvox, 3] integer coordinates
 
-    print(f"Merged attributes: {merged_colors.shape}")
+    print(f"\nMerged attributes: {merged_colors.shape}")
 
-    # ========== Quality Evaluation after Step 2 ==========
-    print("\n" + "=" * 80)
-    print("QUALITY EVALUATION: After voxelization and merging (before RAHT)")
-    print("=" * 80)
+    # ========== DIAGNOSTIC: Check for duplicate voxel positions ==========
+    V_np_check = V.cpu().numpy().astype(np.uint32)
+    unique_positions_set = set(map(tuple, V_np_check))
+    num_unique = len(unique_positions_set)
+    num_total = len(V_np_check)
+    num_duplicates = num_total - num_unique
 
-    # Create temporary PLY files
-    os.makedirs(output_dir, exist_ok=True)
+    if num_duplicates > 0:
+        print(f"  ⚠️  WARNING: Position list contains duplicates!")
+        print(f"     Deduplicating to match merged attributes (Nvox={Nvox})...")
 
-    # Save original Gaussians
-    original_ply_after_step2 = os.path.join(output_dir, "step2_original_N_gaussians.ply")
-    save_ply(original_ply_after_step2, params['means'], params['quats'], params['scales'],
-             params['opacities'], params['colors'])
+        # Deduplicate positions - get unique voxel coordinates
+        # The merged attributes are already per-voxel, so we need unique positions too
+        V_unique_np, unique_indices = np.unique(V_np_check, axis=0, return_index=True)
+        V = torch.from_numpy(V_unique_np).to(device=device, dtype=V.dtype)
 
-    # Convert voxel positions to world coordinates for merged Gaussians
-    voxel_positions_world_step2 = (voxel_positions_int + 0.5) * voxel_info['voxel_size'] + voxel_info['vmin']
+        print(f"     After deduplication: {len(V):,} unique positions")
 
-    # Save merged Gaussians (after voxelization, before compression)
-    merged_ply_after_step2 = os.path.join(output_dir, "step2_merged_Nvox_gaussians.ply")
-    save_ply(merged_ply_after_step2, voxel_positions_world_step2, merged_quats, merged_scales,
-             merged_opacities, merged_colors, octree_depth=J)
-
-    # Render comparison
-    original_params_step2 = {
-        'means': params['means'],
-        'quats': params['quats'],
-        'scales': params['scales'],
-        'opacities': params['opacities'],
-        'colors': params['colors']
-    }
-
-    merged_params_step2 = {
-        'means': voxel_positions_world_step2.float(),
-        'quats': merged_quats.float(),
-        'scales': merged_scales.float(),
-        'opacities': merged_opacities.float(),
-        'colors': merged_colors.float()
-    }
-
-    render_output_dir_step2 = os.path.join(output_dir, "renders_after_step2")
-    rendering_metrics_step2 = try_render_comparison(
-        original_params_step2,
-        merged_params_step2,
-        n_views=n_eval_views,
-        output_dir=render_output_dir_step2
-    )
-
-    if rendering_metrics_step2:
-        print(f"\nQuality after voxelization + merging (BEFORE compression):")
-        print(f"  PSNR: {rendering_metrics_step2['psnr_avg']:.2f} ± {rendering_metrics_step2['psnr_std']:.2f} dB")
-        print(f"  Range: [{rendering_metrics_step2['psnr_min']:.2f}, {rendering_metrics_step2['psnr_max']:.2f}] dB")
+        # Verify this matches Nvox from voxelization
+        if len(V) != Nvox:
+            print(f"  ⚠️  WARNING: Deduplicated count ({len(V)}) != Nvox ({Nvox})")
+            print(f"     This might indicate an issue with voxelization or merging.")
     else:
-        print("\nRendering comparison failed (camera metadata may be missing)")
+        print(f"  ✓ All positions are unique (matches expected Nvox={Nvox})")
+
+    # ========== Step 3: Compress positions using Octree ==========
+    if use_position_codec:
+        print("\n" + "=" * 80)
+        print("STEP 3: Compress voxelized positions using GPU Octree codec")
+        print("=" * 80)
+
+        # Convert to numpy uint32 for octree codec
+        V_np = V.cpu().numpy().astype(np.uint32)
+        print(f"  Position data type: {V_np.dtype}")
+        print(f"  Position range: [{V_np.min()}, {V_np.max()}]")
+        print(f"  First 3 positions: {V_np[:3].tolist()}")
+
+        # Serialize positions to bytes
+        buffer = io.BytesIO()
+        buffer.write(np.uint32(len(V_np)).tobytes())
+        buffer.write(V_np.tobytes())
+        position_input_bytes = buffer.getvalue()
+
+        # Compress via bitstream (stdin/stdout)
+        octree_bin_path = "/ssd1/haodongw/workspace/3dstream/gsplat/compression/build"
+        compress_result = subprocess.run(
+            [f'{octree_bin_path}/compress_octree', '-i', '-', '-o', '-', '-d', str(J), '-m', str(J)],
+            input=position_input_bytes,
+            capture_output=True,
+            check=True
+        )
+        compressed_positions = compress_result.stdout
+
+        # Parse compression metrics
+        import re
+        compress_stderr = compress_result.stderr.decode()
+        compress_time_match = re.search(r'Compression time:\s+([\d.]+)\s+ms', compress_stderr)
+        compress_time = float(compress_time_match.group(1)) if compress_time_match else None
+
+        print(f"  Positions: {len(V_np):,} points")
+        print(f"  Input:  {len(position_input_bytes):,} bytes ({len(position_input_bytes)/1024:.2f} KB)")
+        print(f"  Output: {len(compressed_positions):,} bytes ({len(compressed_positions)/1024:.2f} KB)")
+        print(f"  Ratio:  {len(position_input_bytes)/len(compressed_positions):.2f}:1")
+        if compress_time:
+            print(f"  Time:   {compress_time:.2f} ms")
+    else:
+        print("\n" + "=" * 80)
+        print("STEP 3: Position codec DISABLED - skipping compression")
+        print("=" * 80)
+        compressed_positions = None
+        compress_time = None
+        position_input_bytes = None
 
     # ========== STEP 3: Prepare for RAHT compression ==========
     print("\n" + "=" * 80)
     print("STEP 3: Prepare attributes for RAHT compression")
     print("=" * 80)
-
-    # Clamp voxel coordinates to [0, 2^J-1] to handle edge cases
-    ## (voxelization should produce values in this range, but floating-point precision
-    ## can sometimes result in boundary values like 2^J, so we clamp defensively)
-    V = torch.clamp(voxel_positions_int.float(), 0, 2**J - 1)
 
     # For RAHT_param, we need to set minV=0 and width=2^J so quantization doesn't change them
     minV_for_raht = torch.tensor([0.0, 0.0, 0.0], dtype=V.dtype, device=device)
@@ -202,13 +217,11 @@ def deploy_compress_decompress(
     print(f"Converting attributes to float64 for lossless RAHT...")
     attributes_to_compress = attributes_to_compress.double()  # float32 → float64
 
-    # Get RAHT parameters
+    # RAHT Prelude
     ListC, FlagsC, weightsC = RAHT_param(V, minV_for_raht, width_for_raht, J, return_one_based=False)
     ListC = [t.to(device) for t in ListC]
     FlagsC = [t.to(device) for t in FlagsC]
     weightsC = [t.to(device) for t in weightsC]
-
-    print(f"RAHT parameters computed (depth {len(ListC)})")
 
     # ========== STEP 4: RAHT compression ==========
     print("\n" + "=" * 80)
@@ -236,109 +249,152 @@ def deploy_compress_decompress(
 
     attributes_reconstructed = inverse_RAHT(Coeff_to_decompress, ListC, FlagsC, weightsC)
     print(f"Reconstructed attributes: {attributes_reconstructed.shape}")
-
-    # ========== COMPARISON: Step 2 vs Final Reconstruction ==========
-    print("\n" + "=" * 80)
-    print("COMPARISON: Lossless RAHT verification (Step 2 → Final)")
-    print("=" * 80)
-    print("Comparing merged attributes (after Step 2) with reconstructed attributes")
-    print("Should be lossless since we're using unquantized RAHT coefficients\n")
-
-    # Split reconstructed attributes (BEFORE any post-processing)
+    
     recon_quats_raw = attributes_reconstructed[:, 0:4]
     recon_scales_raw = attributes_reconstructed[:, 4:7]
     recon_opacities_raw = attributes_reconstructed[:, 7]
     recon_colors_sh_raw = attributes_reconstructed[:, 8:]  # All SH color dimensions
 
-    # Compare RAW reconstructed attributes with merged attributes (before any normalization/clamping)
-    # Convert merged attributes to float64 to match reconstructed precision
-    merged_quats_f64 = merged_quats.double()
-    merged_scales_f64 = merged_scales.double()
-    merged_opacities_f64 = merged_opacities.double()
-    colors_sh_step2_f64 = merged_colors.double()  # All SH dimensions
+    # ========== STEP 6: Position decompression ==========
+    if use_position_codec:
+        print("\n" + "=" * 80)
+        print("STEP 6: Octree Position Decompression")
+        print("=" * 80)
 
-    # Attribute comparisons (should be near-zero for lossless RAHT)
-    quat_diff = (merged_quats_f64 - recon_quats_raw).abs()
-    scale_diff = (merged_scales_f64 - recon_scales_raw).abs()
-    opacity_diff = (merged_opacities_f64 - recon_opacities_raw).abs()
-    color_diff = (colors_sh_step2_f64 - recon_colors_sh_raw).abs()
+        # Decompress via bitstream (stdin/stdout)
+        decompress_result = subprocess.run(
+            [f'{octree_bin_path}/decompress_octree', '-i', '-', '-o', '-', '-d', str(J), '-m', str(J)],
+            input=compressed_positions,
+            capture_output=True,
+            check=True
+        )
+        decompressed_position_bytes = decompress_result.stdout
 
-    # Compute max errors
-    max_quat_error = quat_diff.max().item()
-    max_scale_error = scale_diff.max().item()
-    max_opacity_error = opacity_diff.max().item()
-    max_color_error = color_diff.max().item()
-    overall_max_error = max(max_quat_error, max_scale_error, max_opacity_error, max_color_error)
+        # Parse decompression metrics
+        decompress_stderr = decompress_result.stderr.decode()
+        decompress_time_match = re.search(r'Decompression time:\s+([\d.]+)\s+ms', decompress_stderr)
+        decompress_time = float(decompress_time_match.group(1)) if decompress_time_match else None
 
-    print(f"Max reconstruction errors:")
-    print(f"  Quaternions: {max_quat_error:.6e}")
-    print(f"  Scales:      {max_scale_error:.6e}")
-    print(f"  Opacities:   {max_opacity_error:.6e}")
-    print(f"  Colors (SH): {max_color_error:.6e}")
-    print(f"\nOverall max error: {overall_max_error:.6e}")
-    print(f"Reconstruction is {'✓ LOSSLESS' if overall_max_error < 1e-6 else '✗ LOSSY'}")
+        # Deserialize decompressed positions
+        buffer = io.BytesIO(decompressed_position_bytes)
+        num_decompressed_points = np.frombuffer(buffer.read(4), dtype=np.uint32)[0]
+        V_decompressed = np.frombuffer(buffer.read(), dtype=np.uint32).reshape(num_decompressed_points, 3).copy()
 
-    # Store MSE for return dict (using raw reconstructed attributes in float64)
-    quat_mse = torch.mean((merged_quats_f64 - recon_quats_raw)**2).item()
-    scale_mse = torch.mean((merged_scales_f64 - recon_scales_raw)**2).item()
-    opacity_mse = torch.mean((merged_opacities_f64 - recon_opacities_raw)**2).item()
-    color_mse = torch.mean((colors_sh_step2_f64 - recon_colors_sh_raw)**2).item()
+        print(f"  Decompressed data type: {V_decompressed.dtype}")
+        print(f"  Decompressed range: [{V_decompressed.min()}, {V_decompressed.max()}]")
+        print(f"  First 3 decompressed positions: {V_decompressed[:3].tolist()}")
 
-    # ========== Post-process for rendering/saving ==========
-    print("\n" + "=" * 80)
-    print("Post-processing reconstructed attributes for rendering")
-    print("=" * 80)
+        # Convert back to torch tensor
+        V_decompressed_torch = torch.from_numpy(V_decompressed).to(device=device, dtype=V.dtype)
 
-    # Now apply normalization/clamping for rendering (but this shouldn't affect lossless comparison above)
-    recon_quats = recon_quats_raw / recon_quats_raw.norm(dim=1, keepdim=True)
-    recon_scales = torch.abs(recon_scales_raw)
-    recon_opacities = torch.clamp(recon_opacities_raw, 0, 1)
+        print(f"  Decompressed: {num_decompressed_points:,} positions")
+        if decompress_time:
+            print(f"  Time: {decompress_time:.2f} ms")
 
-    # Reconstruct full color tensor (SH coefficients) directly
-    recon_colors_full = recon_colors_sh_raw
+        # ========== DETAILED VERIFICATION OF DECOMPRESSED POSITIONS ==========
+        print(f"\n  Decompression Correctness Verification:")
+        print(f"  " + "-" * 60)
 
-    print(f"Quaternion normalization max change: {(recon_quats_raw - recon_quats).abs().max():.6e}")
-    print(f"Scale abs() max change: {(recon_scales_raw - recon_scales).abs().max():.6e}")
-    print(f"Opacity clamping max change: {(recon_opacities_raw - recon_opacities).abs().max():.6e}")
+        # Verify count match (use same V_np from compression for consistency)
+        V_np = V.cpu().numpy().astype(np.uint32)  # Must match the format used in compression
+        print(f"  Original positions count: {len(V_np):,}")
+        print(f"  Decompressed count: {num_decompressed_points:,}")
+        count_match = (len(V_np) == num_decompressed_points)
+        print(f"  Count match: {'✓ YES' if count_match else '✗ NO'}")
 
-    # ========== STEP 6: [PLACEHOLDER] Position decompression ==========
-    print("\n" + "=" * 80)
-    print("STEP 6: [PLACEHOLDER] Position decompression")
-    print("=" * 80)
-    print("[TODO] Decompress positions from compressed representation")
-    print("Using original voxel positions for now")
+        if count_match:
+            # Direct element-wise comparison (preserving order)
+            positions_exact_match = np.array_equal(V_np, V_decompressed)
 
-    # Convert voxel positions back to world coordinates
-    voxel_positions_world = (voxel_positions_int + 0.5) * voxel_info['voxel_size'] + voxel_info['vmin']
-    recon_means = voxel_positions_world
+            if positions_exact_match:
+                print(f"  ✓ PERFECT MATCH: All positions identical (value & order)")
+                V_final = V_decompressed_torch
+            else:
+                print(f"  ✗ Order/value mismatch detected")
 
-    # Ensure all reconstructed attributes are float32
-    recon_means = recon_means.float()
-    recon_quats = recon_quats.float()
-    recon_scales = recon_scales.float()
-    recon_opacities = recon_opacities.float()
-    recon_colors_full = recon_colors_full.float()
+                # Set-based verification (spatial coverage)
+                print(f"\n  Spatial Coverage Verification:")
+                original_cells = set(map(tuple, V_np))
+                decompressed_cells = set(map(tuple, V_decompressed))
+
+                print(f"  Original unique cells: {len(original_cells):,}")
+                print(f"  Decompressed cells: {len(decompressed_cells):,}")
+
+                if original_cells == decompressed_cells:
+                    print(f"  ✓ Spatial coverage: PERFECT (same positions, different order)")
+                    print(f"  ⚠️  Octree codec reordered positions - creating mapping to restore order...")
+
+                    # Create mapping from position coordinates to indices
+                    # Original: position -> original index
+                    original_pos_to_idx = {tuple(pos): idx for idx, pos in enumerate(V_np)}
+
+                    # Decompressed: for each decompressed position, find its original index
+                    reorder_indices = np.array([original_pos_to_idx[tuple(pos)] for pos in V_decompressed])
+
+                    # Verify the mapping works
+                    V_reordered = V_np[reorder_indices]
+                    if np.array_equal(V_reordered, V_decompressed):
+                        print(f"  ✓ Reordering mapping created successfully")
+
+                        # Reorder decompressed positions to match original order
+                        # We need the inverse mapping: for each original index, which decompressed index?
+                        inverse_reorder = np.argsort(reorder_indices)
+                        V_final_np = V_decompressed[inverse_reorder]
+
+                        # Verify inverse mapping
+                        if np.array_equal(V_final_np, V_np):
+                            print(f"  ✓ Positions successfully reordered to match original")
+                            V_final = torch.from_numpy(V_final_np).to(device=device, dtype=V.dtype)
+                        else:
+                            print(f"  ✗ WARNING: Reordering verification failed!")
+                            V_final = V_decompressed_torch
+                    else:
+                        print(f"  ✗ WARNING: Mapping verification failed!")
+                        V_final = V_decompressed_torch
+                else:
+                    missing_cells = original_cells - decompressed_cells
+                    extra_cells = decompressed_cells - original_cells
+
+                    print(f"  ✗ Spatial mismatch detected:")
+                    print(f"    Missing cells: {len(missing_cells):,}")
+                    print(f"    Extra cells: {len(extra_cells):,}")
+
+                    if len(missing_cells) <= 5:
+                        print(f"    Missing: {list(missing_cells)}")
+                    if len(extra_cells) <= 5:
+                        print(f"    Extra: {list(extra_cells)}")
+
+                    # Use decompressed positions but warn about potential quality impact
+                    V_final = V_decompressed_torch
+        else:
+            print(f"  ✗ Count mismatch - cannot proceed with verification")
+            V_final = V_decompressed_torch
+
+        print(f"  " + "-" * 60)
+    else:
+        print("\n" + "=" * 80)
+        print("STEP 6: Position decompression DISABLED - using original positions")
+        print("=" * 80)
+        V_final = V
+        decompress_time = None
 
     # ========== STEP 7: Quality evaluation ==========
     print("\n" + "=" * 80)
     print("STEP 7: Quality evaluation")
     print("=" * 80)
-
-    # Save PLY files
-    original_ply_path = os.path.join(output_dir, "original_N_gaussians.ply")
-    save_ply(original_ply_path, params['means'], params['quats'], params['scales'],
-             params['opacities'], params['colors'])
-
-    voxelized_ply_path = os.path.join(output_dir, "voxelized_Nvox_gaussians.ply")
-    save_ply(voxelized_ply_path, recon_means, recon_quats, recon_scales,
-             recon_opacities, recon_colors_full, octree_depth=J)
-
-    # Attribute MSE (should be near-zero for lossless)
-    print("\nAttribute MSE (Step 2 merged vs Final reconstructed):")
-    print(f"  Quaternions: {quat_mse:.6e}")
-    print(f"  Scales:      {scale_mse:.6e}")
-    print(f"  Opacities:   {opacity_mse:.6e}")
-    print(f"  Colors (SH): {color_mse:.6e}")
+    
+    # ========== Post-process for rendering/saving ==========
+    voxel_positions_world = (V_final + 0.5) * voxel_info['voxel_size'] + voxel_info['vmin']
+    recon_means = voxel_positions_world
+    recon_quats = recon_quats_raw / recon_quats_raw.norm(dim=1, keepdim=True)
+    recon_scales = torch.abs(recon_scales_raw)
+    recon_opacities = torch.clamp(recon_opacities_raw, 0, 1)
+    recon_colors = recon_colors_sh_raw
+    recon_means = recon_means.float()
+    recon_quats = recon_quats.float()
+    recon_scales = recon_scales.float()
+    recon_opacities = recon_opacities.float()
+    recon_colors = recon_colors.float()
 
     # Render and compute PSNR
     original_params = {
@@ -354,7 +410,7 @@ def deploy_compress_decompress(
         'quats': recon_quats,
         'scales': recon_scales,
         'opacities': recon_opacities,
-        'colors': recon_colors_full
+        'colors': recon_colors
     }
 
     # Rendering comparison: Original vs Final
@@ -366,60 +422,47 @@ def deploy_compress_decompress(
         output_dir=render_output_dir
     )
 
-    # Rendering comparison: Step 2 merged vs Final (isolate RAHT impact)
-    print("\n" + "-" * 80)
-    print("Rendering comparison: Step 2 merged vs Final reconstruction")
-    print("This isolates the visual quality loss from RAHT compression")
-    print("-" * 80)
-
-    render_output_dir_raht = os.path.join(output_dir, "renders_step2_vs_final")
-    rendering_metrics_raht = try_render_comparison(
-        merged_params_step2,
-        reconstructed_params,
-        n_views=n_eval_views,
-        output_dir=render_output_dir_raht
-    )
-
-    # File size comparison
-    original_size = os.path.getsize(original_ply_path)
-    voxelized_ply_size = os.path.getsize(voxelized_ply_path)
-
     print(f"\n" + "=" * 80)
     print("DEPLOYMENT RESULTS SUMMARY")
     print("=" * 80)
     print(f"Original Gaussians: {N}")
     print(f"Voxelized to: {Nvox} voxels ({N/Nvox:.2f}x reduction)")
     print(f"Testing: Lossless RAHT (no quantization)")
-    print(f"Original PLY: {original_size / 1024 / 1024:.2f} MB")
-    print(f"Voxelized PLY: {voxelized_ply_size / 1024 / 1024:.2f} MB")
+
+    if use_position_codec:
+        print(f"\nPosition Compression (GPU Octree):")
+        print(f"  Original: {len(position_input_bytes):,} bytes ({len(position_input_bytes)/1024:.2f} KB)")
+        print(f"  Compressed: {len(compressed_positions):,} bytes ({len(compressed_positions)/1024:.2f} KB)")
+        print(f"  Ratio: {len(position_input_bytes)/len(compressed_positions):.2f}:1")
+        if compress_time and decompress_time:
+            print(f"  Compress time: {compress_time:.2f} ms")
+            print(f"  Decompress time: {decompress_time:.2f} ms")
+            print(f"  Total codec time: {compress_time + decompress_time:.2f} ms")
+    else:
+        print(f"\nPosition Compression: DISABLED")
 
     if rendering_metrics:
         print(f"\nRendering quality (Original vs Final):")
         print(f"  PSNR: {rendering_metrics['psnr_avg']:.2f} ± {rendering_metrics['psnr_std']:.2f} dB")
         print(f"  Range: [{rendering_metrics['psnr_min']:.2f}, {rendering_metrics['psnr_max']:.2f}] dB")
 
-    if rendering_metrics_raht:
-        print(f"\nRendering quality loss from RAHT compression (Step 2 merged vs Final):")
-        print(f"  PSNR: {rendering_metrics_raht['psnr_avg']:.2f} ± {rendering_metrics_raht['psnr_std']:.2f} dB")
-        print(f"  Range: [{rendering_metrics_raht['psnr_min']:.2f}, {rendering_metrics_raht['psnr_max']:.2f}] dB")
-
-    return {
+    result = {
         'original_count': N,
         'voxelized_count': Nvox,
         'voxelization_ratio': N / Nvox,
-        'original_ply_size_mb': original_size / 1024 / 1024,
-        'voxelized_ply_size_mb': voxelized_ply_size / 1024 / 1024,
         'rendering_metrics': rendering_metrics,
-        'rendering_metrics_step2': rendering_metrics_step2,
-        'rendering_metrics_raht': rendering_metrics_raht,
-        'reconstruction_max_error': overall_max_error,
-        'attribute_mse': {
-            'quaternions': quat_mse,
-            'scales': scale_mse,
-            'opacities': opacity_mse,
-            'colors_sh': color_mse,
-        }
     }
+
+    if use_position_codec:
+        result['position_compression'] = {
+            'original_bytes': len(position_input_bytes),
+            'compressed_bytes': len(compressed_positions),
+            'ratio': len(position_input_bytes) / len(compressed_positions),
+            'compress_time_ms': compress_time,
+            'decompress_time_ms': decompress_time,
+        }
+
+    return result
 
 
 if __name__ == '__main__':
@@ -432,12 +475,9 @@ if __name__ == '__main__':
             color_step=4,
             output_dir="output_deployment",
             device="cuda:0",
-            n_eval_views=50
+            n_eval_views=50,
+            use_position_codec=True
         )
-
-        print("\n" + "=" * 80)
-        print("CODEC DEPLOYMENT COMPLETE")
-        print("=" * 80)
 
     except Exception as e:
         print(f"\nError during deployment: {e}")
