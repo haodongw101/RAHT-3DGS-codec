@@ -6,23 +6,26 @@ Workflow:
 1. Load checkpoint and extract Gaussian parameters
 2. Voxelization and merging
    - Quality evaluation after step 2 (isolates voxelization impact)
-3. Prepare attributes for RAHT compression (convert to float64)
-4. RAHT compression of attributes
-   - Verify RAHT is lossless (error < 1e-6)
-5. Inverse RAHT decompression (using unquantized coefficients)
+3. Compress voxelized positions with GPU Octree codec
+4. Prepare attributes for RAHT compression (convert to float64)
+5. RAHT compression of attributes
+6. Inverse RAHT decompression (using unquantized coefficients)
    - Verify reconstruction is lossless
-6. [Placeholder] Position decompression
-7. Quality evaluation
-   - Compare Step 2 merged vs Final (verifies lossless RAHT)
-   - Compare Original vs Final (overall pipeline quality)
+7. Position decompression
+8. Quality evaluation
 
 """
 
 import torch
 import os
 import numpy as np
-import subprocess
-import io
+import sys
+
+# Add GPU Octree codec Python bindings to path
+_compression_root = '/ssd1/haodongw/workspace/3dstream/gsplat/compression'
+sys.path.insert(0, os.path.join(_compression_root, 'build'))
+sys.path.insert(0, os.path.join(_compression_root, 'python'))
+from octree_codec_dev import compress, decompress
 
 from merge_cluster_cuda import merge_gaussian_clusters_with_indices
 from voxelize_pc import voxelize_pc_batched
@@ -54,7 +57,6 @@ def deploy_compress_decompress(
         output_dir: Directory to save output files
         device: CUDA device to use
         n_eval_views: Number of views for PSNR evaluation
-        require_lossless_raht: If True, raise error if RAHT is not lossless (default: True)
         use_position_codec: If True, compress/decompress positions with GPU Octree codec (default: True)
 
     Returns:
@@ -119,31 +121,6 @@ def deploy_compress_decompress(
 
     print(f"\nMerged attributes: {merged_colors.shape}")
 
-    # ========== DIAGNOSTIC: Check for duplicate voxel positions ==========
-    V_np_check = V.cpu().numpy().astype(np.uint32)
-    unique_positions_set = set(map(tuple, V_np_check))
-    num_unique = len(unique_positions_set)
-    num_total = len(V_np_check)
-    num_duplicates = num_total - num_unique
-
-    if num_duplicates > 0:
-        print(f"  ⚠️  WARNING: Position list contains duplicates!")
-        print(f"     Deduplicating to match merged attributes (Nvox={Nvox})...")
-
-        # Deduplicate positions - get unique voxel coordinates
-        # The merged attributes are already per-voxel, so we need unique positions too
-        V_unique_np, unique_indices = np.unique(V_np_check, axis=0, return_index=True)
-        V = torch.from_numpy(V_unique_np).to(device=device, dtype=V.dtype)
-
-        print(f"     After deduplication: {len(V):,} unique positions")
-
-        # Verify this matches Nvox from voxelization
-        if len(V) != Nvox:
-            print(f"  ⚠️  WARNING: Deduplicated count ({len(V)}) != Nvox ({Nvox})")
-            print(f"     This might indicate an issue with voxelization or merging.")
-    else:
-        print(f"  ✓ All positions are unique (matches expected Nvox={Nvox})")
-
     # ========== Step 3: Compress positions using Octree ==========
     if use_position_codec:
         print("\n" + "=" * 80)
@@ -156,45 +133,30 @@ def deploy_compress_decompress(
         print(f"  Position range: [{V_np.min()}, {V_np.max()}]")
         print(f"  First 3 positions: {V_np[:3].tolist()}")
 
-        # Serialize positions to bytes
-        buffer = io.BytesIO()
-        buffer.write(np.uint32(len(V_np)).tobytes())
-        buffer.write(V_np.tobytes())
-        position_input_bytes = buffer.getvalue()
-
-        # Compress via bitstream (stdin/stdout)
-        octree_bin_path = "/ssd1/haodongw/workspace/3dstream/gsplat/compression/build"
-        compress_result = subprocess.run(
-            [f'{octree_bin_path}/compress_octree', '-i', '-', '-o', '-', '-d', str(J), '-m', str(J)],
-            input=position_input_bytes,
-            capture_output=True,
-            check=True
-        )
-        compressed_positions = compress_result.stdout
-
-        # Parse compression metrics
-        import re
-        compress_stderr = compress_result.stderr.decode()
-        compress_time_match = re.search(r'Compression time:\s+([\d.]+)\s+ms', compress_stderr)
-        compress_time = float(compress_time_match.group(1)) if compress_time_match else None
+        # Compress using Python bindings
+        compress_result = compress(V_np, octree_depth=J, voxel_grid_depth=J, force_64bit_codes=True)
+        compressed_positions = compress_result['compressed_data']
+        compress_time = compress_result['compression_time_ms']
+        position_original_bytes = compress_result['original_size_bytes']
+        position_compressed_bytes = compress_result['compressed_size_bytes']
 
         print(f"  Positions: {len(V_np):,} points")
-        print(f"  Input:  {len(position_input_bytes):,} bytes ({len(position_input_bytes)/1024:.2f} KB)")
-        print(f"  Output: {len(compressed_positions):,} bytes ({len(compressed_positions)/1024:.2f} KB)")
-        print(f"  Ratio:  {len(position_input_bytes)/len(compressed_positions):.2f}:1")
-        if compress_time:
-            print(f"  Time:   {compress_time:.2f} ms")
+        print(f"  Input:  {position_original_bytes:,} bytes ({position_original_bytes/1024:.2f} KB)")
+        print(f"  Output: {position_compressed_bytes:,} bytes ({position_compressed_bytes/1024:.2f} KB)")
+        print(f"  Ratio:  {compress_result['compression_ratio']:.2f}:1")
+        print(f"  Time:   {compress_time:.2f} ms")
     else:
         print("\n" + "=" * 80)
         print("STEP 3: Position codec DISABLED - skipping compression")
         print("=" * 80)
         compressed_positions = None
         compress_time = None
-        position_input_bytes = None
+        position_original_bytes = None
+        position_compressed_bytes = None
 
-    # ========== STEP 3: Prepare for RAHT compression ==========
+    # ========== STEP 4: Prepare for RAHT compression ==========
     print("\n" + "=" * 80)
-    print("STEP 3: Prepare attributes for RAHT compression")
+    print("STEP 4: Prepare attributes for RAHT compression")
     print("=" * 80)
 
     # For RAHT_param, we need to set minV=0 and width=2^J so quantization doesn't change them
@@ -223,62 +185,66 @@ def deploy_compress_decompress(
     FlagsC = [t.to(device) for t in FlagsC]
     weightsC = [t.to(device) for t in weightsC]
 
-    # ========== STEP 4: RAHT compression ==========
+    # ========== STEP 5: RAHT compression ==========
     print("\n" + "=" * 80)
-    print("STEP 4: RAHT compression of attributes")
+    print("STEP 5: RAHT compression of attributes")
     print("=" * 80)
 
     Coeff, w = RAHT2_optimized(attributes_to_compress, ListC, FlagsC, weightsC)
     print(f"RAHT coefficients: {Coeff.shape}")
 
-
     # ========== SKIP: Quantization, Entropy Coding, Dequantization ==========
     print("\n" + "=" * 80)
     print("SKIPPING: Quantization and Entropy Coding")
     print("=" * 80)
-    print("Testing lossless RAHT path (no quantization)")
-    print("Using original RAHT coefficients directly for reconstruction")
 
     # Use original coefficients (no quantization)
     Coeff_to_decompress = Coeff
 
-    # ========== STEP 5: Inverse RAHT ==========
+    # ========== STEP 6: Inverse RAHT ==========
     print("\n" + "=" * 80)
-    print("STEP 5: Inverse RAHT decompression")
+    print("STEP 6: Inverse RAHT decompression")
     print("=" * 80)
 
     attributes_reconstructed = inverse_RAHT(Coeff_to_decompress, ListC, FlagsC, weightsC)
     print(f"Reconstructed attributes: {attributes_reconstructed.shape}")
+
+    # Verify lossless RAHT roundtrip before proceeding
+    print(f"\n  RAHT losslessness check:")
+    diff = attributes_reconstructed - attributes_to_compress
+    max_abs_error = diff.abs().max().item()
+    mean_abs_error = diff.abs().mean().item()
+    denom = max(attributes_to_compress.abs().max().item(), 1e-12)
+    rel_error = max_abs_error / denom
+    raht_allclose = torch.allclose(
+        attributes_reconstructed,
+        attributes_to_compress,
+        rtol=1e-8,
+        atol=1e-10,
+    )
+    print(f"    Max abs error: {max_abs_error:.3e}")
+    print(f"    Mean abs error: {mean_abs_error:.3e}")
+    print(f"    Relative max error: {rel_error:.3e}")
+    print(f"    Lossless RAHT: {'✓' if raht_allclose else '✗'}")
+    if not raht_allclose:
+        print("    WARNING: RAHT reconstruction is not lossless.")
     
     recon_quats_raw = attributes_reconstructed[:, 0:4]
     recon_scales_raw = attributes_reconstructed[:, 4:7]
     recon_opacities_raw = attributes_reconstructed[:, 7]
     recon_colors_sh_raw = attributes_reconstructed[:, 8:]  # All SH color dimensions
 
-    # ========== STEP 6: Position decompression ==========
+    # ========== STEP 7: Position decompression ==========
     if use_position_codec:
         print("\n" + "=" * 80)
-        print("STEP 6: Octree Position Decompression")
+        print("STEP 7: Octree Position Decompression")
         print("=" * 80)
 
-        # Decompress via bitstream (stdin/stdout)
-        decompress_result = subprocess.run(
-            [f'{octree_bin_path}/decompress_octree', '-i', '-', '-o', '-', '-d', str(J), '-m', str(J)],
-            input=compressed_positions,
-            capture_output=True,
-            check=True
-        )
-        decompressed_position_bytes = decompress_result.stdout
-
-        # Parse decompression metrics
-        decompress_stderr = decompress_result.stderr.decode()
-        decompress_time_match = re.search(r'Decompression time:\s+([\d.]+)\s+ms', decompress_stderr)
-        decompress_time = float(decompress_time_match.group(1)) if decompress_time_match else None
-
-        # Deserialize decompressed positions
-        buffer = io.BytesIO(decompressed_position_bytes)
-        num_decompressed_points = np.frombuffer(buffer.read(4), dtype=np.uint32)[0]
-        V_decompressed = np.frombuffer(buffer.read(), dtype=np.uint32).reshape(num_decompressed_points, 3).copy()
+        # Decompress using Python bindings
+        decompress_result = decompress(compressed_positions, octree_depth=J, voxel_grid_depth=J, force_64bit_codes=True)
+        V_decompressed = decompress_result['positions']
+        decompress_time = decompress_result['decompression_time_ms']
+        num_decompressed_points = len(V_decompressed)
 
         print(f"  Decompressed data type: {V_decompressed.dtype}")
         print(f"  Decompressed range: [{V_decompressed.min()}, {V_decompressed.max()}]")
@@ -288,8 +254,7 @@ def deploy_compress_decompress(
         V_decompressed_torch = torch.from_numpy(V_decompressed).to(device=device, dtype=V.dtype)
 
         print(f"  Decompressed: {num_decompressed_points:,} positions")
-        if decompress_time:
-            print(f"  Time: {decompress_time:.2f} ms")
+        print(f"  Time: {decompress_time:.2f} ms")
 
         # ========== DETAILED VERIFICATION OF DECOMPRESSED POSITIONS ==========
         print(f"\n  Decompression Correctness Verification:")
@@ -373,14 +338,14 @@ def deploy_compress_decompress(
         print(f"  " + "-" * 60)
     else:
         print("\n" + "=" * 80)
-        print("STEP 6: Position decompression DISABLED - using original positions")
+        print("STEP 7: Position decompression DISABLED - using original positions")
         print("=" * 80)
         V_final = V
         decompress_time = None
 
-    # ========== STEP 7: Quality evaluation ==========
+    # ========== STEP 8: Quality evaluation ==========
     print("\n" + "=" * 80)
-    print("STEP 7: Quality evaluation")
+    print("STEP 8: Quality evaluation")
     print("=" * 80)
     
     # ========== Post-process for rendering/saving ==========
@@ -427,13 +392,12 @@ def deploy_compress_decompress(
     print("=" * 80)
     print(f"Original Gaussians: {N}")
     print(f"Voxelized to: {Nvox} voxels ({N/Nvox:.2f}x reduction)")
-    print(f"Testing: Lossless RAHT (no quantization)")
 
     if use_position_codec:
         print(f"\nPosition Compression (GPU Octree):")
-        print(f"  Original: {len(position_input_bytes):,} bytes ({len(position_input_bytes)/1024:.2f} KB)")
-        print(f"  Compressed: {len(compressed_positions):,} bytes ({len(compressed_positions)/1024:.2f} KB)")
-        print(f"  Ratio: {len(position_input_bytes)/len(compressed_positions):.2f}:1")
+        print(f"  Original: {position_original_bytes:,} bytes ({position_original_bytes/1024:.2f} KB)")
+        print(f"  Compressed: {position_compressed_bytes:,} bytes ({position_compressed_bytes/1024:.2f} KB)")
+        print(f"  Ratio: {position_original_bytes/position_compressed_bytes:.2f}:1")
         if compress_time and decompress_time:
             print(f"  Compress time: {compress_time:.2f} ms")
             print(f"  Decompress time: {decompress_time:.2f} ms")
@@ -455,9 +419,9 @@ def deploy_compress_decompress(
 
     if use_position_codec:
         result['position_compression'] = {
-            'original_bytes': len(position_input_bytes),
-            'compressed_bytes': len(compressed_positions),
-            'ratio': len(position_input_bytes) / len(compressed_positions),
+            'original_bytes': position_original_bytes,
+            'compressed_bytes': position_compressed_bytes,
+            'ratio': position_original_bytes / position_compressed_bytes,
             'compress_time_ms': compress_time,
             'decompress_time_ms': decompress_time,
         }
